@@ -1,22 +1,5 @@
 version: 2
 updates:
-  # GitHub Actions used in .github/workflows/
-  # Updates the pinned commit SHA and the "# vX.Y.Z" comment together
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "08:00"
-      timezone: "Europe/Berlin"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "ci"
-    groups:
-      # One PR for all minor/patch updates instead of one per action
-      actions-minor-patch:
-        update-types: ["minor", "patch"]
-
   # Terraform providers (.terraform.lock.hcl) and module versions (?ref=vX.Y.Z)
   - package-ecosystem: "terraform"
     directory: "/"
