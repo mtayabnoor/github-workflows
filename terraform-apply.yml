@@ -1,0 +1,222 @@
+name: Terraform Apply
+
+# Called from each environment repo when a PR is closed. Runs in the context of
+# the CALLING repo: its code, its secrets, its pull request and its GITHUB_TOKEN.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name, e.g. dev, staging, prod. Must match the plan workflow's input."
+        type: string
+        required: true
+      aws_region:
+        type: string
+        default: "eu-central-1"
+      tf_version:
+        description: "Must match the version used by the plan workflow"
+        type: string
+        default: "1.10.5"
+      working_directory:
+        description: "Folder with the Terraform root module, relative to the repo root"
+        type: string
+        default: "."
+      plan_workflow:
+        description: "File name of the CALLING repo's plan workflow, used to find the plan run"
+        type: string
+        default: "terraform-plan.yml"
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      TF_PLAN_PASSPHRASE:
+        required: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  apply:
+    name: Apply (${{ inputs.environment }})
+    # Only PRs that were merged, not closed without merging
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # Never cancel an in-flight apply; queue subsequent runs instead
+    concurrency:
+      group: terraform-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Find plan run for PR head commit
+        id: find-plan
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ARTIFACT_NAME: tfplan-${{ inputs.environment }}-${{ github.event.pull_request.number }}
+          PLAN_WORKFLOW: ${{ inputs.plan_workflow }}
+        with:
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              ...context.repo,
+              workflow_id: process.env.PLAN_WORKFLOW,
+              head_sha: process.env.HEAD_SHA,
+              event: 'pull_request',
+              per_page: 1,
+            });
+            let run = data.workflow_runs[0];
+            if (!run) {
+              core.setFailed(`No Terraform Plan run found for commit ${process.env.HEAD_SHA}. Open a new PR to re-plan and apply.`);
+              return;
+            }
+
+            // The PR may have been merged while its plan was still running; wait up to 15 minutes
+            const deadline = Date.now() + 15 * 60 * 1000;
+            while (run.status !== 'completed' && Date.now() < deadline) {
+              core.info(`Plan run ${run.html_url} is '${run.status}', waiting...`);
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+              ({ data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: run.id }));
+            }
+
+            core.setOutput('run_url', run.html_url);
+
+            if (run.conclusion !== 'success') {
+              core.setFailed(`Latest Terraform Plan run for commit ${process.env.HEAD_SHA} is '${run.conclusion ?? run.status}', not 'success': ${run.html_url}. Fix it in a new PR to re-plan and apply.`);
+              return;
+            }
+
+            // Every successful plan uploads an artifact (with or without changes),
+            // so a missing one means it expired or was deleted. Fail instead of
+            // silently skipping, otherwise AWS drifts from main without anyone noticing.
+            const { data: artifacts } = await github.rest.actions.listWorkflowRunArtifacts({
+              ...context.repo,
+              run_id: run.id,
+              name: process.env.ARTIFACT_NAME,
+            });
+            if (!artifacts.artifacts.some((a) => !a.expired)) {
+              core.setFailed(`Plan artifact ${process.env.ARTIFACT_NAME} is missing or expired for ${run.html_url}. The merged changes were NOT applied. Open a new PR (or re-run the plan) to re-plan and apply.`);
+              return;
+            }
+
+            core.info(`Using plan run ${run.html_url}`);
+            core.setOutput('run_id', run.id);
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.event.pull_request.number }}
+          path: plan-artifact
+          run-id: ${{ steps.find-plan.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Read plan result
+        id: result
+        run: |
+          code="$(tr -d '[:space:]' < plan-artifact/exitcode.txt)"
+          case "$code" in
+            2) echo "has_changes=true" >> "$GITHUB_OUTPUT" ;;
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT"
+               echo "Plan ${{ steps.find-plan.outputs.run_url }} has no changes. Nothing to apply." ;;
+            *) echo "::error::Unexpected plan exit code '$code'"; exit 1 ;;
+          esac
+
+      - name: Checkout PR head commit
+        if: steps.result.outputs.has_changes == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: repo
+
+      - name: Decrypt plan
+        if: steps.result.outputs.has_changes == 'true'
+        env:
+          TF_PLAN_PASSPHRASE: ${{ secrets.TF_PLAN_PASSPHRASE }}
+          TF_DIR: repo/${{ inputs.working_directory }}
+        run: |
+          gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-fd 0 \
+            --decrypt --output "$TF_DIR/tfplan" plan-artifact/tfplan.gpg <<< "$TF_PLAN_PASSPHRASE"
+
+      - name: Configure AWS credentials
+        if: steps.result.outputs.has_changes == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Set up Terraform
+        if: steps.result.outputs.has_changes == 'true'
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        if: steps.result.outputs.has_changes == 'true'
+        working-directory: repo/${{ inputs.working_directory }}
+        run: terraform init -no-color
+
+      # Applies exactly the reviewed plan; Terraform rejects it if state changed since it was created
+      - name: Terraform apply
+        id: apply
+        if: steps.result.outputs.has_changes == 'true'
+        working-directory: repo/${{ inputs.working_directory }}
+        run: |
+          set -o pipefail
+          terraform apply -no-color -lock-timeout=5m -auto-approve tfplan 2>&1 | tee "$GITHUB_WORKSPACE/apply.txt"
+
+      # Comments on every outcome except "no changes", including failures before apply
+      - name: Comment apply result on PR
+        if: always() && steps.result.outputs.has_changes != 'false'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          APPLY_OUTCOME: ${{ steps.apply.outcome }}
+          PLAN_RUN_URL: ${{ steps.find-plan.outputs.run_url }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const applied = process.env.APPLY_OUTCOME === 'success';
+            const applyRan = ['success', 'failure'].includes(process.env.APPLY_OUTCOME);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let message;
+            if (applied) {
+              message = 'Plan applied successfully.';
+            } else if (applyRan) {
+              message = '**Apply failed.** If the plan is stale (state changed after it was created), open a new PR to re-plan and apply.';
+            } else {
+              message = `**Failed before apply. Nothing was changed in AWS.** See the [apply run](${runUrl}) for the failing step.`;
+            }
+
+            let details = '';
+            if (applyRan) {
+              let output = fs.existsSync('apply.txt') ? fs.readFileSync('apply.txt', 'utf8') : 'Apply output not available.';
+              const limit = 60000;
+              if (output.length > limit) {
+                output = '... output truncated, see the workflow run for full output.\n\n' + output.slice(-limit);
+              }
+              details = `<details><summary>Show apply output</summary>\n\n\`\`\`\n${output}\n\`\`\`\n\n</details>`;
+            }
+
+            const planLink = process.env.PLAN_RUN_URL ? `[Plan run](${process.env.PLAN_RUN_URL}) · ` : '';
+            const body = `### Terraform Apply — \`${env}\` ${applied ? '✅' : '❌'}
+
+            ${message}
+
+            ${details}
+
+            *Merged by ${context.payload.pull_request.merged_by.login} · ${planLink}[Apply run](${runUrl})*`;
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
