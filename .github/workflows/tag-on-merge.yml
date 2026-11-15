@@ -3,16 +3,31 @@ name: Tag on Merge
 # Bumps the patch version by default. To bump major/minor instead:
 #   - merged PR: add a "major" or "minor" label to the PR
 #   - direct push: put "#major" or "#minor" in the commit message
+#
+# Runs for this repository itself (push) and can be called from other
+# repositories (workflow_call). When called, it runs in the context of the
+# CALLING repo: its code, its tags, its push event and its GITHUB_TOKEN.
+#
+#   on:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: write
+#     pull-requests: read
+#   jobs:
+#     tag:
+#       uses: mtayabnoor/github-workflows/.github/workflows/tag-on-merge.yml@vX.Y.Z
 on:
   push:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: write        # needed to push the tag
   pull-requests: read   # needed to read the merged PR's labels
 
 concurrency:
-  group: tag-on-merge
+  group: tag-on-merge-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
